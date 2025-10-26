@@ -1,65 +1,98 @@
-# customer_balance_app.py
 import streamlit as st
 import pandas as pd
 from datetime import datetime
 import os
 import sys
+import base64
+import requests
+from io import StringIO
 
-FILE_NAME = "customers.csv"
+# --- CONFIG -----------------------------------------------------------------
 COLUMNS = [
     "DATE",
     "CUSTOMER NAME",
-    "AMOUNT OWED",         # total owed by customer
-    "BALANCE PAID",        # accumulated payments received so far
-    "BALANCE AS OF TODAY", # computed = AMOUNT OWED - BALANCE PAID (but editable)
+    "AMOUNT OWED",
+    "BALANCE PAID",
+    "BALANCE AS OF TODAY",
     "STATUS"
 ]
 
-# --- Helpers for file handling ------------------------------------------------
-def ensure_file():
-    if not os.path.exists(FILE_NAME):
-        df = pd.DataFrame(columns=COLUMNS)
-        df.to_csv(FILE_NAME, index=False)
+# --- GITHUB CONFIG ----------------------------------------------------------
+GITHUB_TOKEN = st.secrets["GITHUB_TOKEN"]
+REPO_NAME = st.secrets["REPO_NAME"]
+FILE_PATH = st.secrets["FILE_PATH"]
+API_URL = f"https://api.github.com/repos/{REPO_NAME}/contents/{FILE_PATH}"
+HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"}
 
-def load_data():
-    ensure_file()
-    df = pd.read_csv(FILE_NAME)
-    # enforce numeric types and compute balance column if missing or inconsistent
-    for col in ["AMOUNT OWED", "BALANCE PAID", "BALANCE AS OF TODAY"]:
-        if col not in df.columns:
-            df[col] = 0.0
-    df["AMOUNT OWED"] = pd.to_numeric(df["AMOUNT OWED"], errors="coerce").fillna(0.0)
-    df["BALANCE PAID"] = pd.to_numeric(df["BALANCE PAID"], errors="coerce").fillna(0.0)
-    # If BALANCE AS OF TODAY exists but looks wrong, recompute to be safe
-    df["BALANCE AS OF TODAY"] = (df["AMOUNT OWED"] - df["BALANCE PAID"]).clip(lower=0.0)
-    if "STATUS" not in df.columns:
-        df["STATUS"] = df["BALANCE AS OF TODAY"].apply(lambda b: "Cleared ✅" if b <= 0 else "Pending ⏳")
-    return df
 
-def save_data(df):
-    # ensure columns order
+# --- GITHUB HELPERS ---------------------------------------------------------
+def github_load_csv():
+    """Fetch CSV from GitHub repo (via API). If missing, return empty DataFrame."""
+    res = requests.get(API_URL, headers=HEADERS)
+    if res.status_code == 200:
+        content = base64.b64decode(res.json()["content"]).decode()
+        df = pd.read_csv(StringIO(content))
+        return df
+    else:
+        # File not found or empty repo
+        return pd.DataFrame(columns=COLUMNS)
+
+
+def github_save_csv(df):
+    """Save CSV back to GitHub (create or update file)."""
     df = df.reindex(columns=COLUMNS)
-    df.to_csv(FILE_NAME, index=False)
+    csv_content = df.to_csv(index=False)
+    encoded = base64.b64encode(csv_content.encode()).decode()
 
+    # Check if file exists (to include its SHA for update)
+    get_res = requests.get(API_URL, headers=HEADERS)
+    if get_res.status_code == 200:
+        sha = get_res.json()["sha"]
+    else:
+        sha = None
+
+    payload = {
+        "message": "Update customers.csv from Streamlit app",
+        "content": encoded,
+        "sha": sha
+    }
+    put_res = requests.put(API_URL, headers=HEADERS, json=payload)
+    if put_res.status_code not in (200, 201):
+        st.error(f"❌ GitHub save failed: {put_res.status_code} {put_res.text}")
+    else:
+        st.success("✅ Saved to GitHub successfully.")
+
+
+# --- STATUS COMPUTE ---------------------------------------------------------
 def compute_status(balance):
     return "Cleared ✅" if float(balance) <= 0 else "Pending ⏳"
 
-# --- Business logic ---------------------------------------------------------
-def add_new_customer(name: str, amount_owed: float, payment_now: float):
+
+# --- BUSINESS LOGIC ---------------------------------------------------------
+def load_data():
+    df = github_load_csv()
+    for col in ["AMOUNT OWED", "BALANCE PAID", "BALANCE AS OF TODAY"]:
+        df[col] = pd.to_numeric(df.get(col, 0.0), errors="coerce").fillna(0.0)
+    df["BALANCE AS OF TODAY"] = (df["AMOUNT OWED"] - df["BALANCE PAID"]).clip(lower=0.0)
+    df["STATUS"] = df["BALANCE AS OF TODAY"].apply(compute_status)
+    return df
+
+
+def add_new_customer(name, amount_owed, payment_now):
     df = load_data()
     key = name.strip().title()
-    if key == "":
+    if not key:
         st.warning("Enter customer name.")
         return
     if key in df["CUSTOMER NAME"].values:
         st.warning(f"Customer '{key}' already exists. Use Update to add payment.")
         return
-    date_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
     balance_paid = float(payment_now)
     balance_as_of_today = max(float(amount_owed) - balance_paid, 0.0)
     status = compute_status(balance_as_of_today)
     new = {
-        "DATE": date_now,
+        "DATE": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "CUSTOMER NAME": key,
         "AMOUNT OWED": float(amount_owed),
         "BALANCE PAID": balance_paid,
@@ -67,129 +100,99 @@ def add_new_customer(name: str, amount_owed: float, payment_now: float):
         "STATUS": status
     }
     df = pd.concat([df, pd.DataFrame([new])], ignore_index=True)
-    save_data(df)
+    github_save_csv(df)
     st.success(f"Added customer '{key}' (balance {balance_as_of_today:.2f})")
 
-def update_customer_add_payment(name: str, payment_now: float, set_balance_manual: float | None):
+
+def update_customer_add_payment(name, payment_now, set_balance_manual):
     df = load_data()
     key = name.strip().title()
-    if key == "":
-        st.warning("Select customer.")
-        return
     if key not in df["CUSTOMER NAME"].values:
         st.error("Customer not found.")
         return
     idx = df.index[df["CUSTOMER NAME"] == key][0]
-    # increment balance paid
+
     prev_paid = float(df.at[idx, "BALANCE PAID"])
     new_paid = prev_paid + float(payment_now)
     df.at[idx, "BALANCE PAID"] = new_paid
-    # compute new balance, unless manual override provided
+
     computed_balance = max(float(df.at[idx, "AMOUNT OWED"]) - new_paid, 0.0)
     if set_balance_manual is None:
         df.at[idx, "BALANCE AS OF TODAY"] = computed_balance
     else:
-        # allow manual adjustment but ensure non-negative
         df.at[idx, "BALANCE AS OF TODAY"] = max(float(set_balance_manual), 0.0)
+
     df.at[idx, "DATE"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     df.at[idx, "STATUS"] = compute_status(df.at[idx, "BALANCE AS OF TODAY"])
-    save_data(df)
-    st.success(f"Updated '{key}': paid now {payment_now:.2f}, balance {df.at[idx, 'BALANCE AS OF TODAY']:.2f}")
 
-# --- App UI -----------------------------------------------------------------
+    github_save_csv(df)
+    st.success(f"Updated '{key}': paid {payment_now:.2f}, balance {df.at[idx, 'BALANCE AS OF TODAY']:.2f}")
+
+
+# --- APP UI -----------------------------------------------------------------
 st.set_page_config(page_title="Customer Balance Tracker", page_icon="💰", layout="centered")
-st.title("💰 Customer Balance Tracker — Shopkeeper workflow")
+st.title("💰 Customer Balance Tracker (GitHub Synced)")
 
-menu = st.sidebar.selectbox("Menu", ["Add New Customer", "Update Customer (Record Payment)", "View / Edit Table", "Debug Info"])
+menu = st.sidebar.selectbox("Menu", ["Add New Customer", "Update Customer", "View / Edit Table", "Debug Info"])
 
 if menu == "Add New Customer":
-    st.header("Add new customer record")
+    st.header("Add New Customer")
     with st.form("add_form", clear_on_submit=True):
         name = st.text_input("Customer Name")
         amount_owed = st.number_input("Total Amount Owed (UGX)", min_value=0.0, step=100.0, format="%.2f")
-        payment_now = st.number_input("Payment Now (UGX) — amount customer pays now", min_value=0.0, step=100.0, format="%.2f")
-        submitted = st.form_submit_button("Add Customer")
-        if submitted:
+        payment_now = st.number_input("Payment Now (UGX)", min_value=0.0, step=100.0, format="%.2f")
+        if st.form_submit_button("Add Customer"):
             add_new_customer(name, amount_owed, payment_now)
 
-elif menu == "Update Customer (Record Payment)":
-    st.header("Update existing customer — record a payment")
+elif menu == "Update Customer":
+    st.header("Record Payment / Update")
     df = load_data()
     if df.empty:
-        st.info("No customers found — add a new customer first.")
+        st.info("No customers found.")
     else:
         names = df["CUSTOMER NAME"].tolist()
         selected = st.selectbox("Select customer", [""] + names)
         if selected:
             idx = df.index[df["CUSTOMER NAME"] == selected][0]
-            st.write("**Current values:**")
-            st.write(f"- Total owed: {df.at[idx,'AMOUNT OWED']:.2f}")
-            st.write(f"- Balance paid so far: {df.at[idx,'BALANCE PAID']:.2f}")
-            st.write(f"- Balance as of today (computed): {df.at[idx,'BALANCE AS OF TODAY']:.2f}")
-            st.write(f"- Status: {df.at[idx,'STATUS']}")
+            st.write(f"**Total owed:** {df.at[idx,'AMOUNT OWED']:.2f}")
+            st.write(f"**Balance paid so far:** {df.at[idx,'BALANCE PAID']:.2f}")
+            st.write(f"**Balance as of today:** {df.at[idx,'BALANCE AS OF TODAY']:.2f}")
+            st.write(f"**Status:** {df.at[idx,'STATUS']}")
             st.markdown("---")
-            with st.form("update_form", clear_on_submit=False):
-                payment_now = st.number_input("Payment Now (UGX) — add to Balance Paid", min_value=0.0, step=100.0, format="%.2f")
-                manual_balance = st.number_input(
-                    "Manual Balance As Of Today (optional) — leave 0 to use computed", 
-                    min_value=0.0, step=100.0, format="%.2f", value=0.0
-                )
-                submit_update = st.form_submit_button("Apply Payment / Update")
-                if submit_update:
-                    # If manual_balance is 0 but computed balance truly is 0, that's fine.
-                    # We interpret manual_balance==0.0 as 'no manual override' only when computed balance != 0.
-                    override = None
-                    if manual_balance != 0.0:
-                        override = manual_balance
+            with st.form("update_form"):
+                payment_now = st.number_input("Payment Now (UGX)", min_value=0.0, step=100.0, format="%.2f")
+                manual_balance = st.number_input("Manual Balance Override (optional)", min_value=0.0, step=100.0, format="%.2f", value=0.0)
+                if st.form_submit_button("Apply Payment / Update"):
+                    override = manual_balance if manual_balance != 0 else None
                     update_customer_add_payment(selected, payment_now, override)
 
 elif menu == "View / Edit Table":
-    st.header("View and (optionally) edit balances")
+    st.header("Customer Records (Editable)")
     df = load_data()
     if df.empty:
-        st.info("No records. Add customers first.")
+        st.info("No records.")
     else:
-        st.write("You can edit `BALANCE AS OF TODAY` directly below (then click Save Edited Table).")
-        # keep DATE,CUSTOMER,AMOUNT,BALANCE_PAID read-only; BALANCE AS OF TODAY editable
-        # Using st.data_editor if available:
-        try:
-            edited = st.data_editor(
-                df,
-                num_rows="dynamic",
-                use_container_width=True,
-                column_config={
-                    "BALANCE AS OF TODAY": st.column_config.NumberColumn(
-                        "BALANCE AS OF TODAY (editable)", min_value=0.0, format="%.2f"
-                    )
-                },
-                disabled=["DATE", "CUSTOMER NAME", "AMOUNT OWED", "BALANCE PAID", "STATUS"]
-            )
-            if st.button("Save Edited Table"):
-                # Update STATUS based on edited balance
-                edited["BALANCE AS OF TODAY"] = edited["BALANCE AS OF TODAY"].clip(lower=0.0)
-                edited["STATUS"] = edited["BALANCE AS OF TODAY"].apply(compute_status)
-                save_data(edited)
-                st.success("Saved edits and updated statuses.")
-        except Exception:
-            # Fallback: show simple table and provide a simple edit/save route
-            st.warning("Interactive table editor not available. Showing plain table.")
-            st.dataframe(df, use_container_width=True)
-            if st.button("Recompute statuses and save (no edits)"):
-                df["STATUS"] = df["BALANCE AS OF TODAY"].apply(compute_status)
-                save_data(df)
-                st.success("Saved.")
-
-    st.download_button("Download CSV", data=df.to_csv(index=False).encode("utf-8"), file_name="customers.csv", mime="text/csv")
+        edited = st.data_editor(
+            df,
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "BALANCE AS OF TODAY": st.column_config.NumberColumn(
+                    "BALANCE AS OF TODAY (editable)", min_value=0.0, format="%.2f"
+                )
+            },
+            disabled=["DATE", "CUSTOMER NAME", "AMOUNT OWED", "BALANCE PAID", "STATUS"]
+        )
+        if st.button("Save Edits"):
+            edited["BALANCE AS OF TODAY"] = edited["BALANCE AS OF TODAY"].clip(lower=0.0)
+            edited["STATUS"] = edited["BALANCE AS OF TODAY"].apply(compute_status)
+            github_save_csv(edited)
 
 elif menu == "Debug Info":
-    st.header("Debug / Environment Info")
-    st.write(f"Script path: {os.path.abspath(__file__)}")
-    st.write(f"Data file exists: {os.path.exists(FILE_NAME)}")
+    st.header("Debug Info")
     st.write(f"Python: {sys.version}")
-    try:
-        st.write("Data preview:")
-        st.dataframe(load_data().head(20))
-    except Exception as e:
-        st.exception(e)
+    st.write(f"Repo: {REPO_NAME}")
+    st.write(f"File Path: {FILE_PATH}")
+    df = load_data()
+    st.dataframe(df.head(10))
 
-# --- end --------------------------------------------------------------------
