@@ -195,4 +195,3 @@ elif menu == "Debug Info":
     st.write(f"File Path: {FILE_PATH}")
     df = load_data()
     st.dataframe(df.head(10))
-
